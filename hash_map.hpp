@@ -5,9 +5,12 @@
 #include <vector>
 
 struct HashMap {
+    // Global pointer to this HashMap instance
+    upcxx::dist_object<upcxx::global_ptr<HashMap>> global_ptr;
+
     // Local storage
     std::vector<kmer_pair> data;
-    std::vector<bool> used;
+    std::vector<int> used;
     
     // Size of the local portion
     size_t my_size;
@@ -32,9 +35,13 @@ struct HashMap {
     // Local operations
     bool local_insert(const kmer_pair& kmer);
     bool local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
+
+    // Slot manipulation
+    bool request_slot(uint64_t slot);
 };
 
-HashMap::HashMap(size_t size) { 
+HashMap::HashMap(size_t size) 
+    : global_ptr(upcxx::global_ptr<HashMap>(this)) { 
     // Calculate the size for each rank
     int rank_n = upcxx::rank_n();
     int rank_me = upcxx::rank_me();
@@ -47,7 +54,7 @@ HashMap::HashMap(size_t size) {
     
     // Allocate local storage
     data.resize(my_size);
-    used.resize(my_size, false);
+    used.resize(my_size, 0);
     
     // Ensure all processes have initialized
     upcxx::barrier();
@@ -84,6 +91,12 @@ int HashMap::get_target_rank(uint64_t hash_val) const noexcept {
     return hash_val % upcxx::rank_n();
 }
 
+bool HashMap::request_slot(uint64_t slot) {
+    // Try to set slot to used (1) if it's currently unused (0)
+    int expected = 0;
+    return std::atomic_compare_exchange_strong(&used[slot], &expected, 1);
+}
+
 bool HashMap::insert(const kmer_pair& kmer) {
     uint64_t hash_val = kmer.hash();
     int target_rank = get_target_rank(hash_val);
@@ -94,10 +107,11 @@ bool HashMap::insert(const kmer_pair& kmer) {
     } else {
         // Remote insert using RPC
         return upcxx::rpc(target_rank, 
-            [](const kmer_pair& kmer) {
-                // Reconstruct local insert on the target rank
-                return upcxx::current_instance()->local_insert(kmer);
-            }, kmer).wait();
+            [](upcxx::global_ptr<HashMap> global_map, const kmer_pair& kmer) {
+                // Dereference the global pointer to get the local HashMap
+                HashMap* local_map = global_map.local();
+                return local_map->local_insert(kmer);
+            }, global_ptr.member(), kmer).wait();
     }
 }
 
@@ -111,12 +125,13 @@ bool HashMap::find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     } else {
         // Remote find using RPC
         auto result = upcxx::rpc(target_rank,
-            [](const pkmer_t& key_kmer) {
-                // Reconstruct local find on the target rank
+            [](upcxx::global_ptr<HashMap> global_map, const pkmer_t& key_kmer) {
+                // Dereference the global pointer to get the local HashMap
+                HashMap* local_map = global_map.local();
                 kmer_pair val_kmer;
-                bool found = upcxx::current_instance()->local_find(key_kmer, val_kmer);
+                bool found = local_map->local_find(key_kmer, val_kmer);
                 return std::make_pair(found, val_kmer);
-            }, key_kmer).wait();
+            }, global_ptr.member(), key_kmer).wait();
         
         if (result.first) {
             val_kmer = result.second;
@@ -131,18 +146,13 @@ bool HashMap::local_insert(const kmer_pair& kmer) {
     uint64_t probe = 0;
     bool success = false;
     
-    while (probe < my_size && !success) {
-        uint64_t slot = get_local_slot(hash_val, probe);
-        
-        // Simple check and swap without atomics
-        if (!used[slot]) {
-            used[slot] = true;
+    do {
+        uint64_t slot = get_local_slot(hash_val, probe++);
+        success = request_slot(slot);
+        if (success) {
             data[slot] = kmer;
-            success = true;
         }
-        
-        probe++;
-    }
+    } while (!success && probe < my_size);
     
     return success;
 }
@@ -152,9 +162,8 @@ bool HashMap::local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     uint64_t probe = 0;
     bool success = false;
     
-    while (probe < my_size && !success) {
-        uint64_t slot = get_local_slot(hash_val, probe);
-        
+    do {
+        uint64_t slot = get_local_slot(hash_val, probe++);
         if (used[slot]) {
             val_kmer = data[slot];
             if (val_kmer.kmer == key_kmer) {
@@ -165,9 +174,7 @@ bool HashMap::local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
             // If we find an empty slot, the key is not present
             break;
         }
-        
-        probe++;
-    }
+    } while (probe < my_size);
     
     return success;
 }

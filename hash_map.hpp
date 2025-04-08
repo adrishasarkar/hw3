@@ -44,7 +44,7 @@ struct HashMap {
 };
 
 HashMap::HashMap(size_t size) 
-    : local_ptr(upcxx::make_global(this)) {
+    : local_ptr(this) { 
     // Calculate the size for each rank
     int rank_n = upcxx::rank_n();
     int rank_me = upcxx::rank_me();
@@ -188,17 +188,12 @@ kmer_pair HashMap::read_slot(uint64_t slot) {
 }
 
 bool HashMap::request_slot(uint64_t slot) {
-    // Use atomic compare-exchange, with proper error handling
     // Initialize with 0 (empty)
     int expected = 0;
     
     // Try to set to 1 (used) if it's currently 0
-    auto result = upcxx::atomic_compare_exchange_strong(
-        &used[slot], 
-        expected, 
-        1
-    ).wait();
+    bool success = std::atomic_compare_exchange_strong(&used[slot], &expected, 1);
     
-    // If the operation returned 0, it succeeded (was empty, now marked as used)
-    return (result == 0);
+    // Return true if the operation succeeded (slot was empty and is now marked as used)
+    return success;
 }

@@ -12,9 +12,6 @@ struct HashMap {
     // Size of the local portion
     size_t my_size;
     
-    // Distributed object reference for this hash map
-    upcxx::dist_object<upcxx::global_ptr<HashMap>> local_ptr;
-    
     // Constructor
     HashMap(size_t size);
     
@@ -37,8 +34,7 @@ struct HashMap {
     bool local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
 };
 
-HashMap::HashMap(size_t size) 
-    : local_ptr(upcxx::global_ptr<HashMap>(this)) { 
+HashMap::HashMap(size_t size) { 
     // Calculate the size for each rank
     int rank_n = upcxx::rank_n();
     int rank_me = upcxx::rank_me();
@@ -98,10 +94,10 @@ bool HashMap::insert(const kmer_pair& kmer) {
     } else {
         // Remote insert using RPC
         return upcxx::rpc(target_rank, 
-            [](const kmer_pair& kmer, upcxx::dist_object<upcxx::global_ptr<HashMap>>& local_ptr) {
-                HashMap* local_map = local_ptr->local();
-                return local_map->local_insert(kmer);
-            }, kmer, local_ptr).wait();
+            [](const kmer_pair& kmer) {
+                // Reconstruct local insert on the target rank
+                return upcxx::current_instance()->local_insert(kmer);
+            }, kmer).wait();
     }
 }
 
@@ -115,12 +111,12 @@ bool HashMap::find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     } else {
         // Remote find using RPC
         auto result = upcxx::rpc(target_rank,
-            [](const pkmer_t& key_kmer, upcxx::dist_object<upcxx::global_ptr<HashMap>>& local_ptr) {
-                HashMap* local_map = local_ptr->local();
+            [](const pkmer_t& key_kmer) {
+                // Reconstruct local find on the target rank
                 kmer_pair val_kmer;
-                bool found = local_map->local_find(key_kmer, val_kmer);
+                bool found = upcxx::current_instance()->local_find(key_kmer, val_kmer);
                 return std::make_pair(found, val_kmer);
-            }, key_kmer, local_ptr).wait();
+            }, key_kmer).wait();
         
         if (result.first) {
             val_kmer = result.second;

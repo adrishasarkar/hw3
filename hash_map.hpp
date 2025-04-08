@@ -7,7 +7,7 @@
 struct HashMap {
     // Local storage
     std::vector<kmer_pair> data;
-    std::vector<int> used;
+    std::vector<bool> used;
     
     // Size of the local portion
     size_t my_size;
@@ -35,12 +35,6 @@ struct HashMap {
     // Local operations
     bool local_insert(const kmer_pair& kmer);
     bool local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
-    
-    // Helper functions
-    void write_slot(uint64_t slot, const kmer_pair& kmer);
-    kmer_pair read_slot(uint64_t slot);
-    bool request_slot(uint64_t slot);
-    bool slot_used(uint64_t slot);
 };
 
 HashMap::HashMap(size_t size) 
@@ -57,7 +51,7 @@ HashMap::HashMap(size_t size)
     
     // Allocate local storage
     data.resize(my_size);
-    used.resize(my_size, 0);
+    used.resize(my_size, false);
     
     // Ensure all processes have initialized
     upcxx::barrier();
@@ -141,13 +135,18 @@ bool HashMap::local_insert(const kmer_pair& kmer) {
     uint64_t probe = 0;
     bool success = false;
     
-    do {
-        uint64_t slot = get_local_slot(hash_val, probe++);
-        success = request_slot(slot);
-        if (success) {
-            write_slot(slot, kmer);
+    while (probe < my_size && !success) {
+        uint64_t slot = get_local_slot(hash_val, probe);
+        
+        // Simple check and swap without atomics
+        if (!used[slot]) {
+            used[slot] = true;
+            data[slot] = kmer;
+            success = true;
         }
-    } while (!success && probe < my_size);
+        
+        probe++;
+    }
     
     return success;
 }
@@ -157,10 +156,11 @@ bool HashMap::local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     uint64_t probe = 0;
     bool success = false;
     
-    do {
-        uint64_t slot = get_local_slot(hash_val, probe++);
-        if (slot_used(slot)) {
-            val_kmer = read_slot(slot);
+    while (probe < my_size && !success) {
+        uint64_t slot = get_local_slot(hash_val, probe);
+        
+        if (used[slot]) {
+            val_kmer = data[slot];
             if (val_kmer.kmer == key_kmer) {
                 success = true;
                 break;
@@ -169,31 +169,9 @@ bool HashMap::local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
             // If we find an empty slot, the key is not present
             break;
         }
-    } while (probe < my_size);
+        
+        probe++;
+    }
     
-    return success;
-}
-
-// Helper functions
-bool HashMap::slot_used(uint64_t slot) { 
-    return used[slot] != 0; 
-}
-
-void HashMap::write_slot(uint64_t slot, const kmer_pair& kmer) { 
-    data[slot] = kmer; 
-}
-
-kmer_pair HashMap::read_slot(uint64_t slot) { 
-    return data[slot]; 
-}
-
-bool HashMap::request_slot(uint64_t slot) {
-    // Initialize with 0 (empty)
-    int expected = 0;
-    
-    // Try to set to 1 (used) if it's currently 0
-    bool success = std::atomic_compare_exchange_strong(&used[slot], &expected, 1);
-    
-    // Return true if the operation succeeded (slot was empty and is now marked as used)
     return success;
 }

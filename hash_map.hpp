@@ -3,14 +3,15 @@
 #include "kmer_t.hpp"
 #include <upcxx/upcxx.hpp>
 #include <vector>
+#include <atomic>
 
 struct HashMap {
-    // Global pointer to this HashMap instance
-    upcxx::dist_object<upcxx::global_ptr<HashMap>> global_ptr;
+    // Global pointer 
+    upcxx::global_ptr<HashMap> global_map;
 
     // Local storage
     std::vector<kmer_pair> data;
-    std::vector<int> used;
+    std::vector<std::atomic<int>> used;
     
     // Size of the local portion
     size_t my_size;
@@ -40,8 +41,7 @@ struct HashMap {
     bool request_slot(uint64_t slot);
 };
 
-HashMap::HashMap(size_t size) 
-    : global_ptr(upcxx::global_ptr<HashMap>(this)) { 
+HashMap::HashMap(size_t size) { 
     // Calculate the size for each rank
     int rank_n = upcxx::rank_n();
     int rank_me = upcxx::rank_me();
@@ -54,7 +54,10 @@ HashMap::HashMap(size_t size)
     
     // Allocate local storage
     data.resize(my_size);
-    used.resize(my_size, 0);
+    used.resize(my_size);
+    
+    // Initialize global pointer 
+    global_map = upcxx::global_ptr<HashMap>(this);
     
     // Ensure all processes have initialized
     upcxx::barrier();
@@ -92,9 +95,9 @@ int HashMap::get_target_rank(uint64_t hash_val) const noexcept {
 }
 
 bool HashMap::request_slot(uint64_t slot) {
-    // Try to set slot to used (1) if it's currently unused (0)
+    // Atomic compare and swap to mark slot as used
     int expected = 0;
-    return std::atomic_compare_exchange_strong(&used[slot], &expected, 1);
+    return used[slot].compare_exchange_strong(expected, 1);
 }
 
 bool HashMap::insert(const kmer_pair& kmer) {
@@ -111,7 +114,7 @@ bool HashMap::insert(const kmer_pair& kmer) {
                 // Dereference the global pointer to get the local HashMap
                 HashMap* local_map = global_map.local();
                 return local_map->local_insert(kmer);
-            }, global_ptr.member(), kmer).wait();
+            }, global_map, kmer).wait();
     }
 }
 
@@ -131,7 +134,7 @@ bool HashMap::find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
                 kmer_pair val_kmer;
                 bool found = local_map->local_find(key_kmer, val_kmer);
                 return std::make_pair(found, val_kmer);
-            }, global_ptr.member(), key_kmer).wait();
+            }, global_map, key_kmer).wait();
         
         if (result.first) {
             val_kmer = result.second;
@@ -164,7 +167,7 @@ bool HashMap::local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     
     do {
         uint64_t slot = get_local_slot(hash_val, probe++);
-        if (used[slot]) {
+        if (used[slot] == 1) {
             val_kmer = data[slot];
             if (val_kmer.kmer == key_kmer) {
                 success = true;

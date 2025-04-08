@@ -38,7 +38,7 @@ struct HashMap {
 };
 
 HashMap::HashMap(size_t size) 
-    : local_ptr(this) { 
+    : local_ptr(upcxx::global_ptr<HashMap>(this)) { 
     // Calculate the size for each rank
     int rank_n = upcxx::rank_n();
     int rank_me = upcxx::rank_me();

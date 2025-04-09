@@ -41,17 +41,17 @@ struct HashMap {
         while (!success && probe < size()) {
             uint64_t slot = (hash + probe) % size();
             
-            // Atomic compare and swap to claim the slot
-            int expected = 0;
-            auto slot_ptr = used + slot;
+            // Create an atomic reference to the used flag
+            upcxx::atomic<int> slot_atomic(used + slot);
             
-            bool claimed = upcxx::atomic_compare_exchange(slot_ptr, expected, 1)
-                .wait();
+            // Attempt atomic compare-exchange
+            int expected = 0;
+            success = slot_atomic.compare_exchange(expected, 1);
 
-            if (claimed) {
+            if (success) {
                 // Write the k-mer to the claimed slot
                 upcxx::rput(kmer, data + slot).wait();
-                success = true;
+                break;
             }
 
             ++probe;

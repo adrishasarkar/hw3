@@ -1,3 +1,5 @@
+// THIS WORKS. It is a serial implemetation with memory distrubution. working on making the parallel upgrades.
+
 #pragma once
 
 #include "kmer_t.hpp"

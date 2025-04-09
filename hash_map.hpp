@@ -4,32 +4,35 @@
 #include <upcxx/upcxx.hpp>
 
 struct HashMap {
+    // UPC++ global pointers for distributed storage
     upcxx::global_ptr<kmer_pair> data;
-    upcxx::global_ptr<int64_t> used;
+    upcxx::global_ptr<int> used;
 
-    // Atomic domain for synchronization
-    upcxx::atomic_domain<int64_t> ad;
-
+    // Size of the hash table
     size_t my_size;
 
     // Constructor
-    HashMap(size_t size) : 
-        ad({upcxx::atomic_op::load, upcxx::atomic_op::compare_exchange}) {
+    HashMap(size_t size) {
+        // Allocate global memory for data and used flags
         my_size = size;
         data = upcxx::new_array<kmer_pair>(my_size);
-        used = upcxx::new_array<int64_t>(my_size);
+        used = upcxx::new_array<int>(my_size);
 
-        // Initialize used flags to 0
-        for (size_t i = 0; i < my_size; ++i) {
-            upcxx::rput(0, used + i).wait();
+        // Initialize used flags to 0 on the local rank
+        if (upcxx::rank_me() == 0) {
+            for (size_t i = 0; i < my_size; ++i) {
+                upcxx::rput(0, used + i).wait();
+            }
         }
+        upcxx::barrier();
     }
 
+    // Size of the hash table
     size_t size() const noexcept { 
         return my_size; 
     }
 
-    // Insert method using atomic compare-exchange
+    // Insert method
     bool insert(const kmer_pair& kmer) {
         uint64_t hash = kmer.hash();
         uint64_t probe = 0;
@@ -38,21 +41,24 @@ struct HashMap {
         while (!success && probe < size()) {
             uint64_t slot = (hash + probe) % size();
             
-            // Atomic compare-exchange
-            int64_t expected = 0;
-            int64_t desired = 1;
+            // Check if slot is used
+            int current_state = upcxx::rget(used + slot).wait();
             
-            success = ad.compare_exchange(
-                used + slot,     // target location
-                expected,         // expected value
-                desired,          // desired value
-                upcxx::memory_order::memory_order_relaxed
-            ).wait();
-
-            if (success) {
-                // Write the k-mer to the claimed slot
-                upcxx::rput(kmer, data + slot).wait();
-                break;
+            // If slot is unused, attempt to claim it
+            if (current_state == 0) {
+                // Try to put a "locked" state
+                int locked_state = 1;
+                upcxx::rput(locked_state, used + slot).wait();
+                
+                // Verify the slot is still unused
+                int verify_state = upcxx::rget(used + slot).wait();
+                
+                if (verify_state == 1) {
+                    // Successfully claimed, now write the k-mer
+                    upcxx::rput(kmer, data + slot).wait();
+                    success = true;
+                    break;
+                }
             }
 
             ++probe;
@@ -71,10 +77,7 @@ struct HashMap {
             uint64_t slot = (hash + probe) % size();
             
             // Check if slot is used
-            int64_t is_used = ad.load(
-                used + slot, 
-                upcxx::memory_order::memory_order_relaxed
-            ).wait();
+            int is_used = upcxx::rget(used + slot).wait();
 
             if (is_used) {
                 // Retrieve the k-mer
@@ -92,12 +95,8 @@ struct HashMap {
         return found;
     }
 
-    // Destructor
+    // Destructor to clean up global memory
     ~HashMap() {
-        // Destroy atomic domain
-        ad.destroy();
-
-        // Free allocated memory
         upcxx::delete_array(data);
         upcxx::delete_array(used);
     }

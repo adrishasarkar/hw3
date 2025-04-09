@@ -4,18 +4,15 @@
 #include <upcxx/upcxx.hpp>
 
 struct HashMap {
-    // Local storage for this rank's portion of the hash table
+
     std::vector<kmer_pair> data;
     std::vector<int> used;
     
-    // Size information
     size_t my_size;    // Local portion size
     size_t total_size; // Total size across all ranks
     
-    // Distributed object reference for accessing remote portions
     upcxx::dist_object<HashMap*> dobj;
     
-    // Constructor
     HashMap(size_t size);
     
     // Size functions
@@ -30,7 +27,6 @@ struct HashMap {
     bool local_insert(const kmer_pair& kmer);
     bool local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
     
-    // Helper functions
     int get_target_rank(const pkmer_t& key_kmer) const;
     uint64_t get_local_slot(uint64_t hash_val, uint64_t probe) const;
     bool request_slot(uint64_t local_idx);
@@ -39,7 +35,6 @@ struct HashMap {
     kmer_pair read_slot(uint64_t local_idx);
 };
 
-// Constructor
 HashMap::HashMap(size_t size) : dobj(this) {
     // Calculate local portion size
     int rank_n = upcxx::rank_n();
@@ -160,7 +155,6 @@ bool HashMap::local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     return success;
 }
 
-// Helper functions
 bool HashMap::request_slot(uint64_t local_idx) {
     if (used[local_idx] != 0) {
         return false;

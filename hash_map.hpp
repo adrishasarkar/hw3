@@ -4,39 +4,42 @@
 #include <upcxx/upcxx.hpp>
 
 struct HashMap {
+    // Local storage for this rank's portion of the hash table
     std::vector<kmer_pair> data;
     std::vector<int> used;
-
-    size_t my_size;
-    size_t total_size;
-
+    
+    // Size information
+    size_t my_size;    // Local portion size
+    size_t total_size; // Total size across all ranks
+    
+    // Distributed object reference for accessing remote portions
     upcxx::dist_object<HashMap*> dobj;
-
+    
+    // Constructor
     HashMap(size_t size);
-
+    
+    // Size functions
     size_t size() const noexcept;
     size_t local_size() const noexcept;
-
-
-    // Most important functions: insert and retrieve
-    // k-mers from the hash table.
+    
+    // Main API functions
     bool insert(const kmer_pair& kmer);
     bool find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
+    
     // Local operations (for this rank's portion)
     bool local_insert(const kmer_pair& kmer);
     bool local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
-
+    
     // Helper functions
-
-    // Write and read to a logical data slot in the table.
-    void write_slot(uint64_t slot, const kmer_pair& kmer);
-    kmer_pair read_slot(uint64_t slot);
-
-    // Request a slot or check if it's already used.
-    bool request_slot(uint64_t slot);
-    bool slot_used(uint64_t slot);
+    int get_target_rank(const pkmer_t& key_kmer) const;
+    uint64_t get_local_slot(uint64_t hash_val, uint64_t probe) const;
+    bool request_slot(uint64_t local_idx);
+    bool slot_used(uint64_t local_idx);
+    void write_slot(uint64_t local_idx, const kmer_pair& kmer);
+    kmer_pair read_slot(uint64_t local_idx);
 };
 
+// Constructor
 HashMap::HashMap(size_t size) : dobj(this) {
     // Calculate local portion size
     int rank_n = upcxx::rank_n();
@@ -62,7 +65,7 @@ size_t HashMap::size() const noexcept {
     return total_size;
 }
 
-/ Get local portion size
+// Get local portion size
 size_t HashMap::local_size() const noexcept {
     return my_size;
 }
@@ -110,28 +113,6 @@ bool HashMap::local_insert(const kmer_pair& kmer) {
     return success;
 }
 
-// Helper functions
-bool HashMap::request_slot(uint64_t local_idx) {
-    if (used[local_idx] != 0) {
-        return false;
-    } else {
-        used[local_idx] = 1;
-        return true;
-    }
-}
-
-bool HashMap::slot_used(uint64_t local_idx) {
-    return used[local_idx] != 0;
-}
-
-void HashMap::write_slot(uint64_t local_idx, const kmer_pair& kmer) {
-    data[local_idx] = kmer;
-}
-
-kmer_pair HashMap::read_slot(uint64_t local_idx) {
-    return data[local_idx];
-}
-
 // Find function
 bool HashMap::find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     int target_rank = get_target_rank(key_kmer);
@@ -177,4 +158,26 @@ bool HashMap::local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     } while (probe < my_size);
     
     return success;
+}
+
+// Helper functions
+bool HashMap::request_slot(uint64_t local_idx) {
+    if (used[local_idx] != 0) {
+        return false;
+    } else {
+        used[local_idx] = 1;
+        return true;
+    }
+}
+
+bool HashMap::slot_used(uint64_t local_idx) {
+    return used[local_idx] != 0;
+}
+
+void HashMap::write_slot(uint64_t local_idx, const kmer_pair& kmer) {
+    data[local_idx] = kmer;
+}
+
+kmer_pair HashMap::read_slot(uint64_t local_idx) {
+    return data[local_idx];
 }

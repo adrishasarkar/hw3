@@ -3,181 +3,123 @@
 #include "kmer_t.hpp"
 #include <upcxx/upcxx.hpp>
 #include <vector>
-#include <atomic>
 
 struct HashMap {
-    // Global pointer 
-    upcxx::global_ptr<HashMap> global_map;
+    // Vector of global pointers, each pointing to an array on a different rank
+    std::vector<upcxx::global_ptr<kmer_pair>> data_segments;
+    std::vector<upcxx::global_ptr<int>> used_segments;
 
-    // Local storage
-    std::vector<kmer_pair> data;
-    std::vector<std::atomic<int>> used;
+    // Local size of hash table segment for each rank
+    size_t local_size;
     
-    // Size of the local portion
-    size_t my_size;
-    
-    // Constructor
-    HashMap(size_t size);
-    
-    // Size functions
-    size_t size() const noexcept;
-    size_t local_size() const noexcept;
-    
-    // Calculate local slot from global hash
-    uint64_t get_local_slot(uint64_t hash_val, uint64_t probe) const noexcept;
-    
-    // Get the target rank for a key
-    int get_target_rank(uint64_t hash_val) const noexcept;
-    
-    // Main API functions
-    bool insert(const kmer_pair& kmer);
-    bool find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
-    
-    // Local operations
-    bool local_insert(const kmer_pair& kmer);
-    bool local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
+    // Total distributed hash table size
+    size_t total_size;
 
-    // Slot manipulation
-    bool request_slot(uint64_t slot);
-};
+    // Constructor for distributed hash table
+    HashMap(size_t total_table_size) {
+        // Calculate local size for each rank
+        local_size = total_table_size / upcxx::rank_n();
+        total_size = total_table_size;
 
-HashMap::HashMap(size_t size) { 
-    // Calculate the size for each rank
-    int rank_n = upcxx::rank_n();
-    int rank_me = upcxx::rank_me();
-    
-    // Evenly distribute the hash table (with remainder to first ranks)
-    size_t base_size = size / rank_n;
-    size_t remainder = size % rank_n;
-    
-    my_size = base_size + (rank_me < remainder ? 1 : 0);
-    
-    // Allocate local storage
-    data.resize(my_size);
-    used.resize(my_size);
-    
-    // Initialize global pointer 
-    global_map = upcxx::global_ptr<HashMap>(this);
-    
-    // Ensure all processes have initialized
-    upcxx::barrier();
-}
+        // Allocate segments for each rank
+        for (int i = 0; i < upcxx::rank_n(); ++i) {
+            // Allocate data segment
+            auto data_seg = upcxx::make_global<kmer_pair>(local_size);
+            data_segments.push_back(data_seg);
 
-size_t HashMap::size() const noexcept {
-    // Calculate total size across all ranks
-    int rank_n = upcxx::rank_n();
-    size_t total_size = 0;
-    
-    // Gather sizes from all ranks
-    std::vector<size_t> all_sizes(rank_n);
-    all_sizes[upcxx::rank_me()] = my_size;
-    
-    for (int i = 0; i < rank_n; i++) {
-        size_t rank_size = upcxx::broadcast(all_sizes[i], i).wait();
-        total_size += rank_size;
-    }
-    
-    return total_size;
-}
-
-size_t HashMap::local_size() const noexcept {
-    return my_size;
-}
-
-uint64_t HashMap::get_local_slot(uint64_t hash_val, uint64_t probe) const noexcept {
-    // Determine the local slot index
-    return (hash_val + probe) % my_size;
-}
-
-int HashMap::get_target_rank(uint64_t hash_val) const noexcept {
-    // Determine which rank owns this hash value
-    return hash_val % upcxx::rank_n();
-}
-
-bool HashMap::request_slot(uint64_t slot) {
-    // Atomic compare and swap to mark slot as used
-    int expected = 0;
-    return used[slot].compare_exchange_strong(expected, 1);
-}
-
-bool HashMap::insert(const kmer_pair& kmer) {
-    uint64_t hash_val = kmer.hash();
-    int target_rank = get_target_rank(hash_val);
-    
-    if (target_rank == upcxx::rank_me()) {
-        // Local insert
-        return local_insert(kmer);
-    } else {
-        // Remote insert using RPC
-        return upcxx::rpc(target_rank, 
-            [](upcxx::global_ptr<HashMap> global_map, const kmer_pair& kmer) {
-                // Dereference the global pointer to get the local HashMap
-                HashMap* local_map = global_map.local();
-                return local_map->local_insert(kmer);
-            }, global_map, kmer).wait();
-    }
-}
-
-bool HashMap::find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
-    uint64_t hash_val = key_kmer.hash();
-    int target_rank = get_target_rank(hash_val);
-    
-    if (target_rank == upcxx::rank_me()) {
-        // Local find
-        return local_find(key_kmer, val_kmer);
-    } else {
-        // Remote find using RPC
-        auto result = upcxx::rpc(target_rank,
-            [](upcxx::global_ptr<HashMap> global_map, const pkmer_t& key_kmer) {
-                // Dereference the global pointer to get the local HashMap
-                HashMap* local_map = global_map.local();
-                kmer_pair val_kmer;
-                bool found = local_map->local_find(key_kmer, val_kmer);
-                return std::make_pair(found, val_kmer);
-            }, global_map, key_kmer).wait();
-        
-        if (result.first) {
-            val_kmer = result.second;
-            return true;
+            // Allocate used flag segment
+            auto used_seg = upcxx::make_global<int>(local_size);
+            used_segments.push_back(used_seg);
         }
-        return false;
     }
-}
 
-bool HashMap::local_insert(const kmer_pair& kmer) {
-    uint64_t hash_val = kmer.hash();
-    uint64_t probe = 0;
-    bool success = false;
-    
-    do {
-        uint64_t slot = get_local_slot(hash_val, probe++);
-        success = request_slot(slot);
-        if (success) {
-            data[slot] = kmer;
-        }
-    } while (!success && probe < my_size);
-    
-    return success;
-}
+    // Determine which rank owns a particular slot
+    int get_owner_rank(uint64_t slot) {
+        return slot / local_size;
+    }
 
-bool HashMap::local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
-    uint64_t hash_val = key_kmer.hash();
-    uint64_t probe = 0;
-    bool success = false;
-    
-    do {
-        uint64_t slot = get_local_slot(hash_val, probe++);
-        if (used[slot] == 1) {
-            val_kmer = data[slot];
-            if (val_kmer.kmer == key_kmer) {
+    // Get local slot within a rank's segment
+    uint64_t get_local_slot(uint64_t slot) {
+        return slot % local_size;
+    }
+
+    // Distributed insert method
+    bool insert(const kmer_pair& kmer) {
+        uint64_t hash = kmer.hash();
+        uint64_t probe = 0;
+        bool success = false;
+
+        while (!success && probe < total_size) {
+            // Calculate global slot
+            uint64_t global_slot = (hash + probe) % total_size;
+            
+            // Determine rank and local slot
+            int owner_rank = get_owner_rank(global_slot);
+            uint64_t local_slot = get_local_slot(global_slot);
+
+            // Try to atomically claim the slot
+            auto slot_ptr = used_segments[owner_rank] + local_slot;
+            
+            // Use a remote atomic operation to try and claim the slot
+            int expected = 0;
+            bool claimed = upcxx::atomic_compare_exchange(slot_ptr, expected, 1)
+                .wait();
+
+            if (claimed) {
+                // Slot successfully claimed, write the data
+                auto data_ptr = data_segments[owner_rank] + local_slot;
+                upcxx::rput(kmer, data_ptr).wait();
                 success = true;
-                break;
             }
-        } else {
-            // If we find an empty slot, the key is not present
-            break;
+
+            ++probe;
         }
-    } while (probe < my_size);
-    
-    return success;
-}
+
+        return success;
+    }
+
+    // Distributed find method
+    bool find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
+        uint64_t hash = key_kmer.hash();
+        uint64_t probe = 0;
+        bool found = false;
+
+        while (!found && probe < total_size) {
+            // Calculate global slot
+            uint64_t global_slot = (hash + probe) % total_size;
+            
+            // Determine rank and local slot
+            int owner_rank = get_owner_rank(global_slot);
+            uint64_t local_slot = get_local_slot(global_slot);
+
+            // Check if slot is used
+            auto used_ptr = used_segments[owner_rank] + local_slot;
+            int is_used = upcxx::rget(used_ptr).wait();
+
+            if (is_used) {
+                // Retrieve the k-mer
+                auto data_ptr = data_segments[owner_rank] + local_slot;
+                val_kmer = upcxx::rget(data_ptr).wait();
+
+                // Check if it matches the key
+                if (val_kmer.kmer == key_kmer) {
+                    found = true;
+                }
+            }
+
+            ++probe;
+        }
+
+        return found;
+    }
+
+    // Cleanup method to free distributed memory
+    void cleanup() {
+        for (auto& seg : data_segments) {
+            upcxx::deallocate(seg);
+        }
+        for (auto& seg : used_segments) {
+            upcxx::deallocate(seg);
+        }
+    }
+};

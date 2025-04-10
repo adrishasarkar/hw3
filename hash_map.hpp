@@ -2,18 +2,42 @@
 
 #include "kmer_t.hpp"
 #include <upcxx/upcxx.hpp>
+#include <list>
+#include <vector>
+#include <iostream> // Add for debugging
 
 struct HashMap {
 
-    std::vector<kmer_pair> data;
-    std::vector<int> used;
+    // Node structure for linked list chaining
+    struct Node {
+        kmer_pair data;
+        Node* next;
+        
+        Node(const kmer_pair& kmer) : data(kmer), next(nullptr) {}
+    };
+    
+    // Vector of linked lists (buckets)
+    std::vector<Node*> buckets;
     
     size_t my_size;    // Local portion size
     size_t total_size; // Total size across all ranks
     
     upcxx::dist_object<HashMap*> dobj;
     
+    // Global pointers for receiving kmers from other ranks
+    std::vector<upcxx::global_ptr<kmer_pair>> recv_ptrs;
+    
+    // Global pointers for sending kmers to other ranks
+    std::vector<upcxx::global_ptr<kmer_pair>> send_ptrs;
+    
+    // Counts of kmers to be received from each rank
+    std::vector<size_t> recv_counts;
+    
+    // Counts of kmers to be sent to each rank
+    std::vector<size_t> send_counts;
+    
     HashMap(size_t size);
+    ~HashMap();
     
     // Size functions
     size_t size() const noexcept;
@@ -28,11 +52,13 @@ struct HashMap {
     bool local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer);
     
     int get_target_rank(const pkmer_t& key_kmer) const;
-    uint64_t get_local_slot(uint64_t hash_val, uint64_t probe) const;
-    bool request_slot(uint64_t local_idx);
-    bool slot_used(uint64_t local_idx);
-    void write_slot(uint64_t local_idx, const kmer_pair& kmer);
-    kmer_pair read_slot(uint64_t local_idx);
+    uint64_t get_local_slot(uint64_t hash_val) const;
+    
+    // Helper functions for memory management
+    void clear_buckets();
+    
+    // New functions for the new insert approach
+    void process_kmers(const std::vector<kmer_pair>& kmers);
 };
 
 HashMap::HashMap(size_t size) : dobj(this) {
@@ -47,12 +73,47 @@ HashMap::HashMap(size_t size) : dobj(this) {
     my_size = base_size + (rank_me < remainder ? 1 : 0);
     total_size = size;
     
-    // Resize local storage
-    data.resize(my_size);
-    used.resize(my_size, 0);
+    // Initialize buckets with nullptr
+    buckets.resize(my_size, nullptr);
+    
+    // Initialize receive pointers vector
+    recv_ptrs.resize(rank_n);
+    
+    // Initialize send pointers vector
+    send_ptrs.resize(rank_n);
+    
+    // Initialize receive counts vector
+    recv_counts.resize(rank_n, 0);
+    
+    // Initialize send counts vector
+    send_counts.resize(rank_n, 0);
     
     // Ensure all ranks are initialized before proceeding
     upcxx::barrier();
+}
+
+HashMap::~HashMap() {
+    clear_buckets();
+    
+    // Clean up any allocated memory for receiving
+    int rank_n = upcxx::rank_n();
+    for (int i = 0; i < rank_n; ++i) {
+        if (recv_ptrs[i] != nullptr) {
+            upcxx::delete_array(recv_ptrs[i]);
+        }
+    }
+}
+
+void HashMap::clear_buckets() {
+    for (size_t i = 0; i < my_size; ++i) {
+        Node* current = buckets[i];
+        while (current != nullptr) {
+            Node* next = current->next;
+            delete current;
+            current = next;
+        }
+        buckets[i] = nullptr;
+    }
 }
 
 // Get total hash table size
@@ -70,42 +131,160 @@ int HashMap::get_target_rank(const pkmer_t& key_kmer) const {
     return key_kmer.hash() % upcxx::rank_n();
 }
 
-// Calculate local slot from hash and probe
-uint64_t HashMap::get_local_slot(uint64_t hash_val, uint64_t probe) const {
-    return (hash_val + probe) % my_size;
+// Calculate local slot from hash
+uint64_t HashMap::get_local_slot(uint64_t hash_val) const {
+    return hash_val % my_size;
 }
 
-// Insert function
+// Insert function - now just calls process_kmers with a single kmer
 bool HashMap::insert(const kmer_pair& kmer) {
-    int target_rank = get_target_rank(kmer.kmer);
-    
-    if (target_rank == upcxx::rank_me()) {
-        // Local insert
-        return local_insert(kmer);
-    } else {
-        // Remote insert using RPC
-        return upcxx::rpc(target_rank,
-            [](const kmer_pair& kmer, upcxx::dist_object<HashMap*>& dobj) {
-                return (*dobj)->local_insert(kmer);
-            }, kmer, dobj).wait();
-    }
+    std::vector<kmer_pair> kmers = {kmer};
+    process_kmers(kmers);
+    return true;
 }
 
-// Local insert implementation
+// Process kmers using the new approach
+void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
+    int rank_n = upcxx::rank_n();
+    int rank_me = upcxx::rank_me();
+    
+    // Step 1: Organize kmers by target rank
+    std::vector<std::vector<kmer_pair>> kmers_by_rank(rank_n);
+    
+    for (const auto& kmer : kmers) {
+        int target_rank = get_target_rank(kmer.kmer);
+        if (target_rank >= 0 && target_rank < rank_n) {
+            kmers_by_rank[target_rank].push_back(kmer);
+        }
+    }
+    
+    // Step 2: Process local kmers first for immediate progress
+    for (const auto& kmer : kmers_by_rank[rank_me]) {
+        local_insert(kmer);
+    }
+    
+    // Step 3: Calculate counts for sending and receiving
+    for (int i = 0; i < rank_n; ++i) {
+        send_counts[i] = kmers_by_rank[i].size();
+    }
+    
+    // Reset receive counts
+    std::fill(recv_counts.begin(), recv_counts.end(), 0);
+    
+    // All-to-all exchange of counts
+    for (int i = 0; i < rank_n; ++i) {
+        if (i != rank_me) {
+            upcxx::rpc(i, 
+                [](size_t count, int sender_rank, upcxx::dist_object<HashMap*>& dobj) {
+                    (*dobj)->recv_counts[sender_rank] = count;
+                }, send_counts[i], rank_me, dobj).wait();
+        } else {
+            recv_counts[i] = send_counts[i];
+        }
+    }
+    
+    // Ensure all ranks have received their counts
+    upcxx::barrier();
+    
+    // Step 4: Allocate memory for receiving kmers
+    for (int i = 0; i < rank_n; ++i) {
+        if (i != rank_me && recv_counts[i] > 0) {
+            // Clean up any previous allocation
+            if (recv_ptrs[i] != nullptr) {
+                upcxx::delete_array(recv_ptrs[i]);
+                recv_ptrs[i] = nullptr;
+            }
+            
+            // Allocate memory for receiving
+            recv_ptrs[i] = upcxx::new_array<kmer_pair>(recv_counts[i]);
+            
+            // Send the pointer to the sender rank
+            if (recv_ptrs[i] != nullptr) {
+                upcxx::rpc(i, 
+                    [](upcxx::global_ptr<kmer_pair> ptr, int target_rank, upcxx::dist_object<HashMap*>& dobj) {
+                        (*dobj)->send_ptrs[target_rank] = ptr;
+                    }, recv_ptrs[i], rank_me, dobj).wait();
+            }
+        }
+    }
+    
+    // Ensure all ranks have received their pointers
+    upcxx::barrier();
+    
+    // Step 5: Use non-blocking rput to send kmers
+    std::vector<upcxx::future<>> rputs;
+    for (int i = 0; i < rank_n; ++i) {
+        if (i != rank_me && !kmers_by_rank[i].empty()) {
+            if (send_ptrs[i] == nullptr) {
+                // Fall back to RPC if no destination pointer
+                for (const auto& kmer : kmers_by_rank[i]) {
+                    upcxx::rpc(i,
+                        [](const kmer_pair& kmer, upcxx::dist_object<HashMap*>& dobj) {
+                            (*dobj)->local_insert(kmer);
+                        }, kmer, dobj).wait();
+                }
+                
+                continue;
+            }
+            
+            // Use single rput for all kmers to this rank
+            rputs.push_back(upcxx::rput(
+                kmers_by_rank[i].data(),  // source pointer
+                send_ptrs[i],             // destination pointer
+                kmers_by_rank[i].size()   // count
+            ));
+        }
+    }
+    
+    // Step 6: Wait for all rputs to complete
+    if (!rputs.empty()) {
+        upcxx::when_all(rputs.begin(), rputs.end()).wait();
+    }
+    
+    // Ensure all data transfers are complete
+    upcxx::barrier();
+    
+    // Step 7: Process received kmers
+    for (int i = 0; i < rank_n; ++i) {
+        if (i != rank_me && recv_counts[i] > 0 && recv_ptrs[i] != nullptr) {
+            // Process each received kmer
+            for (size_t j = 0; j < recv_counts[i]; ++j) {
+                kmer_pair kmer = upcxx::rget(recv_ptrs[i] + j).wait();
+                local_insert(kmer);
+            }
+            
+            // Free memory
+            upcxx::delete_array(recv_ptrs[i]);
+            recv_ptrs[i] = nullptr;
+        }
+    }
+    
+    // Final synchronization
+    upcxx::barrier();
+}
+
+// Local insert implementation using chaining
 bool HashMap::local_insert(const kmer_pair& kmer) {
     uint64_t hash_val = kmer.hash();
-    uint64_t probe = 0;
-    bool success = false;
+    uint64_t slot = get_local_slot(hash_val);
     
-    do {
-        uint64_t slot = get_local_slot(hash_val, probe++);
-        success = request_slot(slot);
-        if (success) {
-            write_slot(slot, kmer);
+    // Check if key already exists
+    Node* current = buckets[slot];
+    while (current != nullptr) {
+        if (current->data.kmer == kmer.kmer) {
+            // Key already exists, update the value
+            current->data = kmer;
+            return true;
         }
-    } while (!success && probe < my_size);
+        current = current->next;
+    }
     
-    return success;
+    // Key doesn't exist, create a new node and add to the bucket
+    Node* newNode = new Node(kmer);
+    newNode->next = buckets[slot];
+    buckets[slot] = newNode;
+    
+    return true;
 }
 
 // Find function
@@ -132,46 +311,20 @@ bool HashMap::find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     }
 }
 
-// Local find implementation
+// Local find implementation using chaining
 bool HashMap::local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     uint64_t hash_val = key_kmer.hash();
-    uint64_t probe = 0;
-    bool success = false;
+    uint64_t slot = get_local_slot(hash_val);
     
-    do {
-        uint64_t slot = get_local_slot(hash_val, probe++);
-        if (slot_used(slot)) {
-            val_kmer = read_slot(slot);
-            if (val_kmer.kmer == key_kmer) {
-                success = true;
-                break;
-            }
-        } else {
-            // If we hit an empty slot, the key is not in the table
-            break;
+    // Traverse the linked list at the bucket
+    Node* current = buckets[slot];
+    while (current != nullptr) {
+        if (current->data.kmer == key_kmer) {
+            val_kmer = current->data;
+            return true;
         }
-    } while (probe < my_size);
-    
-    return success;
-}
-
-bool HashMap::request_slot(uint64_t local_idx) {
-    if (used[local_idx] != 0) {
-        return false;
-    } else {
-        used[local_idx] = 1;
-        return true;
+        current = current->next;
     }
-}
-
-bool HashMap::slot_used(uint64_t local_idx) {
-    return used[local_idx] != 0;
-}
-
-void HashMap::write_slot(uint64_t local_idx, const kmer_pair& kmer) {
-    data[local_idx] = kmer;
-}
-
-kmer_pair HashMap::read_slot(uint64_t local_idx) {
-    return data[local_idx];
+    
+    return false;
 }

@@ -74,16 +74,16 @@ int main(int argc, char** argv) {
 
     std::vector<kmer_pair> start_nodes;
 
+    // Process kmers in batches using the new approach
+    hashmap.process_kmers(kmers);
+    
+    // Collect start nodes
     for (auto& kmer : kmers) {
-        bool success = hashmap.insert(kmer);
-        if (!success) {
-            throw std::runtime_error("Error: HashMap is full!");
-        }
-
         if (kmer.backwardExt() == 'F') {
             start_nodes.push_back(kmer);
         }
     }
+    
     auto end_insert = std::chrono::high_resolution_clock::now();
     upcxx::barrier();
 

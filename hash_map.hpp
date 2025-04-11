@@ -233,9 +233,9 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     }
     
     // Step 6: Wait for all rputs to complete
-    // if (!rputs.empty()) {
-    //     upcxx::when_all(rputs.begin(), rputs.end()).wait();
-    // }
+    if (!rputs.empty()) {
+        upcxx::when_all(rputs.begin(), rputs.end()).wait();
+    }
     
     // Ensure all data transfers are complete
     upcxx::barrier();
@@ -256,7 +256,7 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     }
     
     // Final synchronization
-    // upcxx::barrier();
+    // upcxx::barrier(); // barrier is called after this function in the main function
 }
 
 // Local insert implementation using chaining
@@ -385,7 +385,7 @@ void HashMap::batch_find_kmers(const std::vector<pkmer_t>& key_kmers, std::vecto
             results[original_indices_by_rank[rank_me][i]] = val_kmer;
         }
         else {
-            throw std::runtime_error("Error: k-mer not found in hashmap at local index " + std::to_string(i));
+            throw std::runtime_error("Error: Rank " + std::to_string(rank_me) + " k-mer not found in hashmap at local index " + std::to_string(i));
         }
     }
 
@@ -396,8 +396,8 @@ void HashMap::batch_find_kmers(const std::vector<pkmer_t>& key_kmers, std::vecto
         for (size_t j = 0; j < remote_results.size(); ++j) {
             // Check if the kmer is empty before assigning
             if (remote_results[j].kmer == pkmer_t()) {
-                throw std::runtime_error("Error: k-mer not found in hashmap at rank"  + std::to_string(rank) +
-                    "remote index " + std::to_string(j));
+                throw std::runtime_error("Error: Rank " + std::to_string(rank_me) + " k-mer not found in hashmap at rank "  + std::to_string(rank) +
+                    " remote index " + std::to_string(j));
             }
             results[original_indices_by_rank[rank][j]] = remote_results[j];
         }

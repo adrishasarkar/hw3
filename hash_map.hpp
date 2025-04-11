@@ -57,8 +57,9 @@ struct HashMap {
     // Helper functions for memory management
     void clear_buckets();
     
-    // New functions for the new insert approach
+    // Batch functions
     void process_kmers(const std::vector<kmer_pair>& kmers);
+    void batch_find_kmers(const std::vector<pkmer_t>& key_kmers, std::vector<kmer_pair> & results);
 };
 
 HashMap::HashMap(size_t size) : dobj(this) {
@@ -136,11 +137,20 @@ uint64_t HashMap::get_local_slot(uint64_t hash_val) const {
     return hash_val % my_size;
 }
 
-// Insert function - now just calls process_kmers with a single kmer
+// Insert function
 bool HashMap::insert(const kmer_pair& kmer) {
-    std::vector<kmer_pair> kmers = {kmer};
-    process_kmers(kmers);
-    return true;
+    int target_rank = get_target_rank(kmer.kmer);
+    
+    if (target_rank == upcxx::rank_me()) {
+        // Local insert
+        return local_insert(kmer);
+    } else {
+        // Remote insert using RPC
+        return upcxx::rpc(target_rank,
+            [](const kmer_pair& kmer, upcxx::dist_object<HashMap*>& dobj) {
+                return (*dobj)->local_insert(kmer);
+            }, kmer, dobj).wait();
+    }
 }
 
 // Process kmers using the new approach
@@ -153,9 +163,7 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     
     for (const auto& kmer : kmers) {
         int target_rank = get_target_rank(kmer.kmer);
-        if (target_rank >= 0 && target_rank < rank_n) {
-            kmers_by_rank[target_rank].push_back(kmer);
-        }
+        kmers_by_rank[target_rank].push_back(kmer);
     }
     
     // Step 2: Process local kmers first for immediate progress
@@ -214,19 +222,7 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     // Step 5: Use non-blocking rput to send kmers
     std::vector<upcxx::future<>> rputs;
     for (int i = 0; i < rank_n; ++i) {
-        if (i != rank_me && !kmers_by_rank[i].empty()) {
-            if (send_ptrs[i] == nullptr) {
-                // Fall back to RPC if no destination pointer
-                for (const auto& kmer : kmers_by_rank[i]) {
-                    upcxx::rpc(i,
-                        [](const kmer_pair& kmer, upcxx::dist_object<HashMap*>& dobj) {
-                            (*dobj)->local_insert(kmer);
-                        }, kmer, dobj).wait();
-                }
-                
-                continue;
-            }
-            
+        if (i != rank_me && send_counts[i] > 0) {
             // Use single rput for all kmers to this rank
             rputs.push_back(upcxx::rput(
                 kmers_by_rank[i].data(),  // source pointer
@@ -237,16 +233,16 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     }
     
     // Step 6: Wait for all rputs to complete
-    if (!rputs.empty()) {
-        upcxx::when_all(rputs.begin(), rputs.end()).wait();
-    }
+    // if (!rputs.empty()) {
+    //     upcxx::when_all(rputs.begin(), rputs.end()).wait();
+    // }
     
     // Ensure all data transfers are complete
     upcxx::barrier();
     
     // Step 7: Process received kmers
     for (int i = 0; i < rank_n; ++i) {
-        if (i != rank_me && recv_counts[i] > 0 && recv_ptrs[i] != nullptr) {
+        if (i != rank_me && recv_counts[i] > 0) {
             // Process each received kmer
             for (size_t j = 0; j < recv_counts[i]; ++j) {
                 kmer_pair kmer = upcxx::rget(recv_ptrs[i] + j).wait();
@@ -260,7 +256,7 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     }
     
     // Final synchronization
-    upcxx::barrier();
+    // upcxx::barrier();
 }
 
 // Local insert implementation using chaining
@@ -289,6 +285,10 @@ bool HashMap::local_insert(const kmer_pair& kmer) {
 
 // Find function
 bool HashMap::find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
+    if (key_kmer == pkmer_t()) {
+        throw std::runtime_error("Error: key k-mer is empty!!!");
+    }
+
     int target_rank = get_target_rank(key_kmer);
     
     if (target_rank == upcxx::rank_me()) {
@@ -327,4 +327,79 @@ bool HashMap::local_find(const pkmer_t& key_kmer, kmer_pair& val_kmer) {
     }
     
     return false;
+}
+
+// void HashMap::batch_find_kmers(const std::vector<pkmer_t>& key_kmers, std::vector<kmer_pair> & results) {
+//     for (size_t i = 0; i < key_kmers.size(); ++i) {
+//         kmer_pair val_kmer;
+//         if (find(key_kmers[i], val_kmer)) {
+//             results[i] = val_kmer;
+//         } else {
+//             throw std::runtime_error("Error: k-mer not found in hashmap at index " + std::to_string(i));
+//         }
+//     }
+// }
+
+void HashMap::batch_find_kmers(const std::vector<pkmer_t>& key_kmers, std::vector<kmer_pair> & results) {
+    int rank_n = upcxx::rank_n();
+    int rank_me = upcxx::rank_me();
+    
+    // Organize kmers by target rank
+    std::vector<std::vector<pkmer_t>> kmers_by_rank(rank_n);
+    std::vector<std::vector<size_t>> original_indices_by_rank(rank_n); // To track original positions
+    
+    for (size_t i = 0; i < key_kmers.size(); ++i) {
+        const auto& kmer = key_kmers[i];
+        int target_rank = get_target_rank(kmer);
+        kmers_by_rank[target_rank].push_back(kmer);
+        original_indices_by_rank[target_rank].push_back(i);
+    }
+
+    std::vector<upcxx::future<std::vector<kmer_pair>>> rpcs;
+    std::vector<int> remote_ranks;
+    for (int i = 0; i < rank_n; ++i) {
+        if (i != rank_me && !kmers_by_rank[i].empty()) {
+            remote_ranks.push_back(i);
+            rpcs.push_back(upcxx::rpc(i,
+                [](const std::vector<pkmer_t> key_kmers, upcxx::dist_object<HashMap*>& dobj) -> std::vector<kmer_pair> {
+                    std::vector<kmer_pair> val_kmers;
+                    for (int i = 0; i < key_kmers.size(); ++i) {
+                        kmer_pair val_kmer;
+                        bool found = (*dobj)->local_find(key_kmers[i], val_kmer);
+                        if (found) {
+                            val_kmers.push_back(val_kmer);
+                        } else {
+                            val_kmers.push_back(kmer_pair()); // Push empty kmer_pair if not found
+                        }
+                    }
+                    return val_kmers;
+                }, kmers_by_rank[i], dobj));
+        }
+    }
+
+    // Process local kmers
+    for (size_t i = 0; i < kmers_by_rank[rank_me].size(); ++i) {
+        const auto& kmer = kmers_by_rank[rank_me][i];
+        kmer_pair val_kmer;
+        if (local_find(kmer, val_kmer)) {
+            results[original_indices_by_rank[rank_me][i]] = val_kmer;
+        }
+        else {
+            throw std::runtime_error("Error: k-mer not found in hashmap at local index " + std::to_string(i));
+        }
+    }
+
+    // Process results from remote ranks
+    for (int i = 0; i < remote_ranks.size(); ++i) {
+        int rank = remote_ranks[i];
+        std::vector<kmer_pair> remote_results = rpcs[i].wait();
+        for (size_t j = 0; j < remote_results.size(); ++j) {
+            // Check if the kmer is empty before assigning
+            if (remote_results[j].kmer == pkmer_t()) {
+                throw std::runtime_error("Error: k-mer not found in hashmap at rank"  + std::to_string(rank) +
+                    "remote index " + std::to_string(j));
+            }
+            results[original_indices_by_rank[rank][j]] = remote_results[j];
+        }
+    }
 }

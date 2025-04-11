@@ -95,19 +95,50 @@ int main(int argc, char** argv) {
 
     auto start_read = std::chrono::high_resolution_clock::now();
 
-    std::list<std::list<kmer_pair>> contigs;
+    std::vector<std::list<kmer_pair>> contigs;
+    std::vector<size_t> active_indices;
+
     for (const auto& start_kmer : start_nodes) {
         std::list<kmer_pair> contig;
         contig.push_back(start_kmer);
-        while (contig.back().forwardExt() != 'F') {
-            kmer_pair kmer;
-            bool success = hashmap.find(contig.back().next_kmer(), kmer);
-            if (!success) {
-                throw std::runtime_error("Error: k-mer not found in hashmap.");
-            }
-            contig.push_back(kmer);
+        contigs.push_back(std::move(contig));
+        if (start_kmer.forwardExt() != 'F') {
+            active_indices.push_back(contigs.size() - 1);
         }
-        contigs.push_back(contig);
+    }
+
+    while (!active_indices.empty()) {
+        std::vector<pkmer_t> next_kmers;
+        
+        for (size_t idx : active_indices) {
+            next_kmers.push_back(contigs[idx].back().next_kmer());
+        }
+
+        std::vector<kmer_pair> found_kmers(next_kmers.size(), kmer_pair());
+
+        hashmap.batch_find_kmers(next_kmers, found_kmers);
+
+        std::vector<size_t> new_active_indices;
+        for (size_t i = 0; i < active_indices.size(); ++i) {
+            size_t idx = active_indices[i];
+            const kmer_pair &found = found_kmers[i];
+
+            // if (found.kmer == pkmer_t()) {
+            //     // If a kmer was not found, this is an error condition.
+            //     throw std::runtime_error("Error: k-mer not found in hashmap for contig index " + std::to_string(idx));
+            // }
+            
+            // Extend the contig with the newly found kmer.
+            contigs[idx].push_back(found);
+            
+            // If the contig is still active (the new kmer's forward extension is not 'F'),
+            // keep its index for the next round.
+            if (found.forwardExt() != 'F') {
+                new_active_indices.push_back(idx);
+            }
+        }
+
+        active_indices.swap(new_active_indices);
     }
 
     auto end_read = std::chrono::high_resolution_clock::now();

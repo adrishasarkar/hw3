@@ -220,7 +220,7 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
                 send_ptrs[i] = nullptr;
             }
             
-            size_t array_num_elems = std::max(send_counts[i], seg_num_kmers_per_rank);
+            size_t array_num_elems = std::min(send_counts[i], seg_num_kmers_per_rank);
 
             // Allocate memory for receiving
             send_ptrs[i] = upcxx::new_array<kmer_pair>(array_num_elems);
@@ -261,9 +261,9 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
             size_t to_recv = std::min(seg_num_kmers_per_rank, recv_counts[i] - rcvd_counters[i]);
 
             if (i != rank_me && to_recv > 0) {
-                kmer_pair kmers_rget[to_recv];
+                std::vector<kmer_pair> kmers_rget(recv_counts[i]);
 
-                upcxx::rget(recv_ptrs[i], kmers_rget, to_recv).wait();
+                upcxx::rget(recv_ptrs[i], kmers_rget.data(), to_recv).wait();
                 // Process each received kmer
                 for (kmer_pair& kmer : kmers_rget) {
                     local_insert(kmer);

@@ -196,11 +196,6 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
 
     size_t num_chunks = std::ceil(static_cast<double>(global_max_num_kmers_send) / seg_num_kmers_per_rank);
     
-    // Reset receive counts
-    std::fill(recv_counts.begin(), recv_counts.end(), 0);
-
-    upcxx::barrier();
-    
     // All-to-all exchange of counts
     for (int i = 0; i < rank_n; ++i) {
         if (i != rank_me) {
@@ -260,19 +255,25 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
         // Ensure all data transfers are complete
         upcxx::barrier();
 
-        std::vector<upcxx::future<>> rputs;
+        std::vector<upcxx::future<>> rgets;
+        std::vector<std::vector<kmer_pair>> kmers_rget_vector;
         for (int i = 0; i < rank_n; ++i) {
             size_t to_recv = std::min(seg_num_kmers_per_rank, recv_counts[i] - rcvd_counters[i]);
 
             if (i != rank_me && to_recv > 0) {
-                kmer_pair kmers_rget[to_recv];
+                kmers_rget_vector.push_back(std::vector<kmer_pair>(to_recv));
 
-                upcxx::rget(recv_ptrs[i], kmers_rget, to_recv).wait();
-                // Process each received kmer
-                for (kmer_pair& kmer : kmers_rget) {
-                    local_insert(kmer);
-                }
+                rgets.push_back(upcxx::rget(recv_ptrs[i], kmers_rget_vector.back().data(), to_recv));
+
                 rcvd_counters[i] += to_recv;
+            }
+        }
+
+        // Process each received kmer
+        for (size_t i = 0; i < rgets.size(); ++i) {
+            rgets[i].wait();
+            for (auto& kmer : kmers_rget_vector[i]) {
+                local_insert(kmer);
             }
         }
 

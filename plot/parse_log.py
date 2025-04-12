@@ -82,7 +82,7 @@ def plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks):
     """
     fig, ax = plt.subplots(figsize=(8,4.5))
     
-    # To determine the range for the ideal curve, gather all total_tasks values.
+    # Determine total_tasks range for ideal curves.
     all_total_tasks = []
     for node in nodes:
         for rank in ranks:
@@ -95,7 +95,7 @@ def plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks):
     else:
         x_min, x_max = 1, 1
     
-    # For each node value, plot measured insertion and assembly times.
+    # Plot measured insertion and assembly times for each node.
     for node in nodes:
         x_insertion = []
         y_insertion = []
@@ -105,7 +105,6 @@ def plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks):
             total_tasks = node * rank
             time_ins = insert_df.loc[node, rank]
             time_ass = assembly_df.loc[node, rank]
-            # Only add if the time value is available.
             if pd.notna(time_ins):
                 x_insertion.append(total_tasks)
                 y_insertion.append(time_ins)
@@ -120,11 +119,8 @@ def plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks):
             ax.plot(x_assembly, y_assembly, marker='s', linestyle='-',
                     label=f"Nodes = {node} Assembly")
     
-    # Plot ideal scaling lines for insertion and assembly.
-    # These are defined as T = a / x, with a from the (1,1) measurement.
+    # Plot ideal scaling lines using (1,1) measurement.
     x_vals = np.logspace(np.log10(x_min), np.log10(x_max), num=100)
-    
-    # For insertion times ideal line
     try:
         a_insertion = float(insert_df.loc[1, 1])
     except (KeyError, ValueError, TypeError):
@@ -134,7 +130,6 @@ def plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks):
         ax.plot(x_vals, ideal_insertion, linestyle=':', color='black',
                 label=r"Ideal Insertion Scaling ($x^{-1}$)")
     
-    # For assembly times ideal line
     try:
         a_assembly = float(assembly_df.loc[1, 1])
     except (KeyError, ValueError, TypeError):
@@ -148,13 +143,91 @@ def plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks):
     ax.set_yscale('log')
     ax.set_xlabel("Total Ranks (nodes × ranks per node)")
     ax.set_ylabel("Time (s)")
-    # ax.set_title("Measured and Ideal Insertion & Assembly Times vs Total Tasks (Log-Log)")
     ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
     ax.grid(True, which="both")
     fig.tight_layout()
-    
-    # Save the figure as a JPEG with 300 dpi.
     fig.savefig("insertion_assembly_times.jpg", dpi=300)
+    plt.show()
+
+def plot_time_vs_nodes(insert_df, assembly_df, nodes, target_ranks=[60, 64]):
+    """
+    Create a log-log plot with:
+      - x-axis: number of nodes
+      - y-axis: time in seconds (log scale)
+    
+    For each fixed number of ranks per node (e.g., 60 and 64), the measured
+    insertion times (circle markers, solid lines) and assembly times (square markers, dashed lines)
+    are plotted. Additionally, an ideal scaling line is drawn assuming ideal strong scaling:
+         T = T(1, r) / (nodes)
+    where T(1, r) is the measured time for (1 node, fixed r).
+    
+    Only one legend entry for Ideal Insertion Scaling and one for Ideal Assembly Scaling is added.
+    
+    The figure is saved as a JPEG file with 300 dpi.
+    """
+    fig, ax = plt.subplots(figsize=(8,4.5))
+    
+    # Flags to ensure only one ideal scaling label is added per metric.
+    ideal_insertion_added = False
+    ideal_assembly_added = False
+    
+    for r in target_ranks:
+        nodes_ins = []
+        times_ins = []
+        nodes_ass = []
+        times_ass = []
+        
+        # Gather data for the fixed number of ranks r
+        for node in nodes:
+            # Insertion times for fixed rank r
+            if r in insert_df.columns:
+                time_ins = insert_df.loc[node, r]
+                if pd.notna(time_ins):
+                    nodes_ins.append(node)
+                    times_ins.append(time_ins)
+            # Assembly times for fixed rank r
+            if r in assembly_df.columns:
+                time_ass = assembly_df.loc[node, r]
+                if pd.notna(time_ass):
+                    nodes_ass.append(node)
+                    times_ass.append(time_ass)
+                    
+        # Plot measured data for insertion
+        if nodes_ins:
+            ax.plot(nodes_ins, times_ins, marker='o', linestyle='-',
+                    label=f"Ranks = {r} Insertion")
+        # Plot measured data for assembly
+        if nodes_ass:
+            ax.plot(nodes_ass, times_ass, marker='s', linestyle='--',
+                    label=f"Ranks = {r} Assembly")
+        
+        # Plot ideal scaling lines if measurement at 1 node is available.
+        if 1 in nodes and (r in insert_df.columns) and pd.notna(insert_df.loc[1, r]):
+            a_insertion = insert_df.loc[1, r]
+            x_vals = np.logspace(np.log10(min(nodes)), np.log10(max(nodes)), num=100)
+            ideal_insertion = a_insertion / x_vals
+            lab = "Ideal Insertion Scaling" if not ideal_insertion_added else None
+            ideal_insertion_added = True
+            ax.plot(x_vals, ideal_insertion, linestyle=':', color='black',
+                    label=lab)
+        
+        if 1 in nodes and (r in assembly_df.columns) and pd.notna(assembly_df.loc[1, r]):
+            a_assembly = assembly_df.loc[1, r]
+            x_vals = np.logspace(np.log10(min(nodes)), np.log10(max(nodes)), num=100)
+            ideal_assembly = a_assembly / x_vals
+            lab = "Ideal Assembly Scaling" if not ideal_assembly_added else None
+            ideal_assembly_added = True
+            ax.plot(x_vals, ideal_assembly, linestyle='-.', color='black',
+                    label=lab)
+    
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel("Number of Nodes")
+    ax.set_ylabel("Time (s)")
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+    ax.grid(True, which="both")
+    fig.tight_layout()
+    fig.savefig("time_vs_nodes.jpg", dpi=300)
     plt.show()
 
 def main():
@@ -176,8 +249,11 @@ def main():
     print("\nAssembly Times DataFrame (rows: nodes, columns: ranks per node):")
     print(assembly_df)
     
-    # Create the log-log plot that includes measured and ideal scaling times.
+    # Plot measured and ideal scaling vs. total tasks (existing plot)
     plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks)
+    
+    # Plot time vs. number of nodes for fixed ranks 60 and 64.
+    plot_time_vs_nodes(insert_df, assembly_df, nodes, target_ranks=[60, 64])
 
 if __name__ == "__main__":
     main()

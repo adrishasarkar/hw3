@@ -102,8 +102,8 @@ HashMap::~HashMap() {
     // Clean up any allocated memory for receiving
     int rank_n = upcxx::rank_n();
     for (int i = 0; i < rank_n; ++i) {
-        if (recv_ptrs[i] != nullptr) {
-            upcxx::delete_array(recv_ptrs[i]);
+        if (send_ptrs[i] != nullptr) {
+            upcxx::delete_array(send_ptrs[i]);
         }
     }
 }
@@ -215,27 +215,27 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     
     // Ensure all ranks have received their counts
     upcxx::barrier();
-    
-    // Allocate memory for receiving kmers
+
+    // Allocate memory for sending kmers
     for (int i = 0; i < rank_n; ++i) {
-        if (i != rank_me && recv_counts[i] > 0) {
+        if (i != rank_me && send_counts[i] > 0) {
             // Clean up any previous allocation
-            if (recv_ptrs[i] != nullptr) {
-                upcxx::delete_array(recv_ptrs[i]);
-                recv_ptrs[i] = nullptr;
+            if (send_ptrs[i] != nullptr) {
+                upcxx::delete_array(send_ptrs[i]);
+                send_ptrs[i] = nullptr;
             }
             
-            size_t array_num_elems = std::max(recv_counts[i], seg_num_kmers_per_rank);
+            size_t array_num_elems = std::max(send_counts[i], seg_num_kmers_per_rank);
 
             // Allocate memory for receiving
-            recv_ptrs[i] = upcxx::new_array<kmer_pair>(array_num_elems);
+            send_ptrs[i] = upcxx::new_array<kmer_pair>(array_num_elems);
             
-            // Send the pointer to the sender rank
-            if (recv_ptrs[i] != nullptr) {
+            // Send the pointer to the receiver rank
+            if (send_ptrs[i] != nullptr) {
                 upcxx::rpc(i, 
-                    [](upcxx::global_ptr<kmer_pair> ptr, int target_rank, upcxx::dist_object<HashMap*>& dobj) {
-                        (*dobj)->send_ptrs[target_rank] = ptr;
-                    }, recv_ptrs[i], rank_me, dobj).wait();
+                    [](upcxx::global_ptr<kmer_pair> ptr, int sender_rank, upcxx::dist_object<HashMap*>& dobj) {
+                        (*dobj)->recv_ptrs[sender_rank] = ptr;
+                    }, send_ptrs[i], rank_me, dobj).wait();
             }
         }
     }
@@ -247,36 +247,29 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     std::vector<size_t> rcvd_counters(rank_n, 0);
 
     for (int send_iter = 0; send_iter < num_chunks; ++send_iter) {
-        std::vector<upcxx::future<>> rputs;
-
         for (int i = 0; i < rank_n; ++i) {
             size_t to_send = std::min(seg_num_kmers_per_rank, send_counts[i] - sent_counters[i]);
 
             if (i != rank_me && to_send > 0) {
                 // Use single rput for all kmers to this rank
-                rputs.push_back(upcxx::rput(
-                    kmers_by_rank[i].data() + sent_counters[i],  // source pointer
-                    send_ptrs[i],             // destination pointer
-                    to_send   // count
-                ));
+                std::memcpy(send_ptrs[i].local(), kmers_by_rank[i].data() + sent_counters[i], to_send * sizeof(kmer_pair));
                 sent_counters[i] += to_send;
             }
-        }
-
-        if (!rputs.empty()) {
-            upcxx::when_all(rputs.begin(), rputs.end()).wait();
         }
         
         // Ensure all data transfers are complete
         upcxx::barrier();
 
+        std::vector<upcxx::future<>> rputs;
         for (int i = 0; i < rank_n; ++i) {
             size_t to_recv = std::min(seg_num_kmers_per_rank, recv_counts[i] - rcvd_counters[i]);
 
             if (i != rank_me && to_recv > 0) {
+                kmer_pair kmers_rget[to_recv];
+
+                upcxx::rget(recv_ptrs[i], kmers_rget, to_recv).wait();
                 // Process each received kmer
-                for (size_t j = 0; j < to_recv; ++j) {
-                    kmer_pair kmer = upcxx::rget(recv_ptrs[i] + j).wait();
+                for (kmer_pair& kmer : kmers_rget) {
                     local_insert(kmer);
                 }
                 rcvd_counters[i] += to_recv;
@@ -287,9 +280,9 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     }
 
     for (int i = 0; i < rank_n; ++i) {
-        if (i != rank_me && recv_counts[i] > 0) {
-            upcxx::delete_array(recv_ptrs[i]);
-            recv_ptrs[i] = nullptr;
+        if (i != rank_me && send_counts[i] > 0) {
+            upcxx::delete_array(send_ptrs[i]);
+            send_ptrs[i] = nullptr;
         }
     }
 }

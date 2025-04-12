@@ -158,7 +158,7 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     int rank_n = upcxx::rank_n();
     int rank_me = upcxx::rank_me();
     
-    // Step 1: Organize kmers by target rank
+    // Organize kmers by target rank
     std::vector<std::vector<kmer_pair>> kmers_by_rank(rank_n);
     
     for (const auto& kmer : kmers) {
@@ -166,18 +166,15 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
         kmers_by_rank[target_rank].push_back(kmer);
     }
     
-    // Step 2: Process local kmers first for immediate progress
-    for (const auto& kmer : kmers_by_rank[rank_me]) {
-        local_insert(kmer);
-    }
-    
-    // Step 3: Calculate counts for sending and receiving
+    // Calculate counts for sending and receiving
     for (int i = 0; i < rank_n; ++i) {
         send_counts[i] = kmers_by_rank[i].size();
     }
     
     // Reset receive counts
     std::fill(recv_counts.begin(), recv_counts.end(), 0);
+
+    upcxx::barrier();
     
     // All-to-all exchange of counts
     for (int i = 0; i < rank_n; ++i) {
@@ -194,7 +191,7 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     // Ensure all ranks have received their counts
     upcxx::barrier();
     
-    // Step 4: Allocate memory for receiving kmers
+    // Allocate memory for receiving kmers
     for (int i = 0; i < rank_n; ++i) {
         if (i != rank_me && recv_counts[i] > 0) {
             // Clean up any previous allocation
@@ -219,7 +216,7 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     // Ensure all ranks have received their pointers
     upcxx::barrier();
     
-    // Step 5: Use non-blocking rput to send kmers
+    // Use non-blocking rput to send kmers
     std::vector<upcxx::future<>> rputs;
     for (int i = 0; i < rank_n; ++i) {
         if (i != rank_me && send_counts[i] > 0) {
@@ -231,8 +228,13 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
             ));
         }
     }
+
+    // Process local kmers first for immediate progress
+    for (const auto& kmer : kmers_by_rank[rank_me]) {
+        local_insert(kmer);
+    }
     
-    // Step 6: Wait for all rputs to complete
+    // Wait for all rputs to complete
     if (!rputs.empty()) {
         upcxx::when_all(rputs.begin(), rputs.end()).wait();
     }
@@ -240,7 +242,7 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     // Ensure all data transfers are complete
     upcxx::barrier();
     
-    // Step 7: Process received kmers
+    // Process received kmers
     for (int i = 0; i < rank_n; ++i) {
         if (i != rank_me && recv_counts[i] > 0) {
             // Process each received kmer

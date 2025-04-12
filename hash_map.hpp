@@ -4,7 +4,10 @@
 #include <upcxx/upcxx.hpp>
 #include <list>
 #include <vector>
+#include <cmath>
 #include <iostream> // Add for debugging
+
+#define UPCXX_SEGMENT_MB 120
 
 struct HashMap {
 
@@ -56,7 +59,7 @@ struct HashMap {
     
     // Helper functions for memory management
     void clear_buckets();
-    
+
     // Batch functions
     void process_kmers(const std::vector<kmer_pair>& kmers);
     void batch_find_kmers(const std::vector<pkmer_t>& key_kmers, std::vector<kmer_pair> & results);
@@ -165,11 +168,33 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
         int target_rank = get_target_rank(kmer.kmer);
         kmers_by_rank[target_rank].push_back(kmer);
     }
+
+    // Process local kmers first for immediate progress
+    for (const auto& kmer : kmers_by_rank[rank_me]) {
+        local_insert(kmer);
+    }
     
     // Calculate counts for sending and receiving
     for (int i = 0; i < rank_n; ++i) {
         send_counts[i] = kmers_by_rank[i].size();
     }
+
+    size_t max_num_kmers_send = 0;
+    for (int i = 0; i < rank_n; ++i) {
+        if (i != rank_me) {
+            max_num_kmers_send = std::max(max_num_kmers_send, send_counts[i]);
+        }
+    }
+
+    upcxx::barrier();
+
+    size_t global_max_num_kmers_send = upcxx::reduce_all(max_num_kmers_send, upcxx::op_fast_max).wait();
+    
+    size_t seg_size = static_cast<size_t>(UPCXX_SEGMENT_MB) * 1024 * 1024;
+    size_t seg_num_kmers_per_rank = seg_size / ((rank_n - 1) * sizeof(kmer_pair)); // in Bytes
+    size_t seg_size_per_rank = seg_num_kmers_per_rank * sizeof(kmer_pair); // in Bytes
+
+    size_t num_chunks = std::ceil(static_cast<double>(global_max_num_kmers_send) / seg_num_kmers_per_rank);
     
     // Reset receive counts
     std::fill(recv_counts.begin(), recv_counts.end(), 0);
@@ -200,8 +225,10 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
                 recv_ptrs[i] = nullptr;
             }
             
+            size_t array_num_elems = std::max(recv_counts[i], seg_num_kmers_per_rank);
+
             // Allocate memory for receiving
-            recv_ptrs[i] = upcxx::new_array<kmer_pair>(recv_counts[i]);
+            recv_ptrs[i] = upcxx::new_array<kmer_pair>(array_num_elems);
             
             // Send the pointer to the sender rank
             if (recv_ptrs[i] != nullptr) {
@@ -215,50 +242,56 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     
     // Ensure all ranks have received their pointers
     upcxx::barrier();
-    
-    // Use non-blocking rput to send kmers
-    std::vector<upcxx::future<>> rputs;
-    for (int i = 0; i < rank_n; ++i) {
-        if (i != rank_me && send_counts[i] > 0) {
-            // Use single rput for all kmers to this rank
-            rputs.push_back(upcxx::rput(
-                kmers_by_rank[i].data(),  // source pointer
-                send_ptrs[i],             // destination pointer
-                kmers_by_rank[i].size()   // count
-            ));
+
+    std::vector<size_t> sent_counters(rank_n, 0);
+    std::vector<size_t> rcvd_counters(rank_n, 0);
+
+    for (int send_iter = 0; send_iter < num_chunks; ++send_iter) {
+        std::vector<upcxx::future<>> rputs;
+
+        for (int i = 0; i < rank_n; ++i) {
+            size_t to_send = std::min(seg_num_kmers_per_rank, send_counts[i] - sent_counters[i]);
+
+            if (i != rank_me && to_send > 0) {
+                // Use single rput for all kmers to this rank
+                rputs.push_back(upcxx::rput(
+                    kmers_by_rank[i].data() + sent_counters[i],  // source pointer
+                    send_ptrs[i],             // destination pointer
+                    to_send   // count
+                ));
+                sent_counters[i] += to_send;
+            }
         }
+
+        if (!rputs.empty()) {
+            upcxx::when_all(rputs.begin(), rputs.end()).wait();
+        }
+        
+        // Ensure all data transfers are complete
+        upcxx::barrier();
+
+        for (int i = 0; i < rank_n; ++i) {
+            size_t to_recv = std::min(seg_num_kmers_per_rank, recv_counts[i] - rcvd_counters[i]);
+
+            if (i != rank_me && to_recv > 0) {
+                // Process each received kmer
+                for (size_t j = 0; j < to_recv; ++j) {
+                    kmer_pair kmer = upcxx::rget(recv_ptrs[i] + j).wait();
+                    local_insert(kmer);
+                }
+                rcvd_counters[i] += to_recv;
+            }
+        }
+
+        upcxx::barrier();
     }
 
-    // Process local kmers first for immediate progress
-    for (const auto& kmer : kmers_by_rank[rank_me]) {
-        local_insert(kmer);
-    }
-    
-    // Wait for all rputs to complete
-    if (!rputs.empty()) {
-        upcxx::when_all(rputs.begin(), rputs.end()).wait();
-    }
-    
-    // Ensure all data transfers are complete
-    upcxx::barrier();
-    
-    // Process received kmers
     for (int i = 0; i < rank_n; ++i) {
         if (i != rank_me && recv_counts[i] > 0) {
-            // Process each received kmer
-            for (size_t j = 0; j < recv_counts[i]; ++j) {
-                kmer_pair kmer = upcxx::rget(recv_ptrs[i] + j).wait();
-                local_insert(kmer);
-            }
-            
-            // Free memory
             upcxx::delete_array(recv_ptrs[i]);
             recv_ptrs[i] = nullptr;
         }
     }
-    
-    // Final synchronization
-    // upcxx::barrier(); // barrier is called after this function in the main function
 }
 
 // Local insert implementation using chaining

@@ -255,7 +255,9 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
         // Ensure all data transfers are complete
         upcxx::barrier();
 
-        for (int i = 0; i < rank_n; ++i) {
+        for (int j = 0; j < rank_n; ++j) {
+            int i = (rank_me + j) % rank_n;
+            
             size_t to_recv = std::min(seg_num_kmers_per_rank, recv_counts[i] - rcvd_counters[i]);
 
             if (i != rank_me && to_recv > 0) {

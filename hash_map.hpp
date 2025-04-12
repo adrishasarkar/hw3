@@ -191,10 +191,17 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
     size_t global_max_num_kmers_send = upcxx::reduce_all(max_num_kmers_send, upcxx::op_fast_max).wait();
     
     size_t seg_size = static_cast<size_t>(UPCXX_SEGMENT_MB) * 1024 * 1024;
-    size_t seg_num_kmers_per_rank = seg_size / ((rank_n - 1) * sizeof(kmer_pair)); // in Bytes
-    size_t seg_size_per_rank = seg_num_kmers_per_rank * sizeof(kmer_pair); // in Bytes
+    size_t seg_num_kmers_per_rank;
+    size_t num_chunks;
 
-    size_t num_chunks = std::ceil(static_cast<double>(global_max_num_kmers_send) / seg_num_kmers_per_rank);
+    if (rank_n == 1) {
+        seg_num_kmers_per_rank = 0;
+        num_chunks = 0;
+    }
+    else {
+        seg_num_kmers_per_rank = seg_size / ((rank_n - 1) * sizeof(kmer_pair)); // in Bytes
+        num_chunks = std::ceil(static_cast<double>(global_max_num_kmers_send) / seg_num_kmers_per_rank);
+    }
     
     // All-to-all exchange of counts
     for (int i = 0; i < rank_n; ++i) {

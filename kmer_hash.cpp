@@ -42,6 +42,10 @@ int main(int argc, char** argv) {
         test_prefix = std::string(argv[3]);
     }
 
+    int total_ranks = upcxx::rank_n();            // Total number of UPC++ ranks
+    int ranks_on_node = upcxx::local_team().rank_n();  // Number of ranks on the local node
+    int num_nodes = total_ranks / ranks_on_node;    // Assumes uniform distribution
+
     int ks = kmer_size(kmer_fname);
 
     if (ks != KMER_LEN) {
@@ -89,7 +93,7 @@ int main(int argc, char** argv) {
 
     double insert_time = std::chrono::duration<double>(end_insert - start).count();
     if (run_type != "test") {
-        BUtil::print("Finished inserting in %lf\n", insert_time);
+        BUtil::print("Finished inserting in %lf [kmer file: %s, ranks per node: %d, nodes: %d]\n", insert_time, kmer_fname.c_str(), ranks_on_node, num_nodes);
     }
     upcxx::barrier();
 
@@ -154,7 +158,7 @@ int main(int argc, char** argv) {
         [](int sum, const std::list<kmer_pair>& contig) { return sum + contig.size(); });
 
     if (run_type != "test") {
-        BUtil::print("Assembled in %lf total\n", total.count());
+        BUtil::print("Assembled in %lf total. [kmer file: %s, ranks per node: %d, nodes: %d]\n", total.count(), kmer_fname.c_str(), ranks_on_node, num_nodes);
     }
 
     if (run_type == "verbose") {

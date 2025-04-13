@@ -65,7 +65,7 @@ def build_dataframe(data_dict, nodes, ranks):
             df.loc[n, r] = data_dict.get((n, r), None)
     return df
 
-def plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks):
+def plot_insertion_and_assembly(plot_title, insert_df, assembly_df, nodes, ranks):
     """
     Create a log-log plot with:
       - x-axis: total number of tasks (nodes * ranks per node)
@@ -139,6 +139,7 @@ def plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks):
         ax.plot(x_vals, ideal_assembly, linestyle='--', color='black',
                 label=r"Ideal Assembly Scaling ($x^{-1}$)")
     
+    ax.set_title(plot_title)
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlabel("Total Ranks (nodes × ranks per node)")
@@ -149,7 +150,7 @@ def plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks):
     fig.savefig("insertion_assembly_times.jpg", dpi=300)
     plt.show()
 
-def plot_time_vs_nodes(insert_df, assembly_df, nodes, target_ranks=[60, 64]):
+def plot_time_vs_nodes(plot_title, insert_df, assembly_df, nodes, target_ranks=[60, 64]):
     """
     Create a log-log plot with:
       - x-axis: number of nodes
@@ -218,6 +219,7 @@ def plot_time_vs_nodes(insert_df, assembly_df, nodes, target_ranks=[60, 64]):
             ideal_assembly_added = True
             ax.plot(x_vals, ideal_assembly, linestyle='-.', color='black', label=lab)
     
+    ax.set_title(plot_title)
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlabel("Number of Nodes")
@@ -228,7 +230,7 @@ def plot_time_vs_nodes(insert_df, assembly_df, nodes, target_ranks=[60, 64]):
     fig.savefig("time_vs_nodes.jpg", dpi=300)
     plt.show()
 
-def plot_time_vs_ranks(insert_df, assembly_df, nodes, ranks):
+def plot_time_vs_ranks(plot_title, insert_df, assembly_df, nodes, ranks):
     """
     Create a log-log plot with:
       - x-axis: number of ranks per node (for node = 1 only)
@@ -291,6 +293,7 @@ def plot_time_vs_ranks(insert_df, assembly_df, nodes, ranks):
         ax.plot(x_vals, ideal_assembly, linestyle='-.', color='black',
                 label=r"Ideal Assembly Scaling ($x^{-1}$)")
     
+    ax.set_title(plot_title)
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlabel("Ranks per Node (Node = 1)")
@@ -302,11 +305,12 @@ def plot_time_vs_ranks(insert_df, assembly_df, nodes, ranks):
     plt.show()
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python parse_log.py <log_file.txt>")
+    if len(sys.argv) < 3:
+        print("Usage: python parse_log.py <log_file.txt> <plot_title>")
         sys.exit(1)
 
     log_file = sys.argv[1]
+    plot_title = sys.argv[2]
     
     # Parse the log file.
     insert_dict, assemble_dict, nodes, ranks = parse_log_file(log_file)
@@ -321,13 +325,13 @@ def main():
     print(assembly_df)
     
     # Plot measured and ideal scaling vs. total tasks.
-    plot_insertion_and_assembly(insert_df, assembly_df, nodes, ranks)
+    plot_insertion_and_assembly(plot_title, insert_df, assembly_df, nodes, ranks)
     
     # Plot time vs. number of nodes for fixed ranks 60 and 64.
-    plot_time_vs_nodes(insert_df, assembly_df, nodes, target_ranks=[60, 64])
+    plot_time_vs_nodes(plot_title, insert_df, assembly_df, nodes, target_ranks=[60, 64])
     
     # Plot time vs. number of ranks (only for node 1) with ideal 1/x scaling.
-    plot_time_vs_ranks(insert_df, assembly_df, nodes, ranks)
+    plot_time_vs_ranks(plot_title, insert_df, assembly_df, nodes, ranks)
 
 if __name__ == "__main__":
     main()

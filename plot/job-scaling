@@ -1,0 +1,30 @@
+#!/bin/bash
+#SBATCH -N 8
+#SBATCH -C cpu
+#SBATCH --qos=debug
+#SBATCH -J cs267-hw3-starter
+#SBATCH --ntasks-per-node=64
+#SBATCH -t 00:30:00
+
+
+#OpenMP settings:
+export OMP_NUM_THREADS=1
+export OMP_PLACES=threads
+export OMP_PROC_BIND=spread
+# export GASNET_BACKTRACE=1
+
+#run the application:
+# Define lists of values for -N and --ntasks-per-node
+# Adjust these values based on your available resources.
+node_list=(1 2 4 8)
+tasks_per_node_list=(1 2 4 8 10 16 20 30 32 40 50 60 64)
+
+# Loop over each combination
+for N in "${node_list[@]}"; do
+    for tpn in "${tasks_per_node_list[@]}"; do
+        # echo "Running with -N=${N} and --ntasks-per-node=${tpn}"
+        
+        # Launch the job using srun with the current combination of parameters.
+        srun -N ${N} --ntasks-per-node ${tpn} ./kmer_hash_51 my_datasets/human-chr14-synthetic.txt
+    done
+done

@@ -6,25 +6,30 @@
 #SBATCH --ntasks-per-node=64
 #SBATCH -t 00:30:00
 
-
-#OpenMP settings:
+# OpenMP settings:
 export OMP_NUM_THREADS=1
 export OMP_PLACES=threads
 export OMP_PROC_BIND=spread
 # export GASNET_BACKTRACE=1
 
-#run the application:
+# Set the executable and its associated file in an array
+exec_with_file=(./kmer_hash_51 my_datasets/human-chr14-synthetic.txt)
+# exec_with_file=(./kmer_hash_19 my_datasets/test.txt)
+
 # Define lists of values for -N and --ntasks-per-node
-# Adjust these values based on your available resources.
 node_list=(1 2 4 8)
 tasks_per_node_list=(1 2 4 8 10 16 20 30 32 40 50 60 64)
 
 # Loop over each combination
 for N in "${node_list[@]}"; do
     for tpn in "${tasks_per_node_list[@]}"; do
-        # echo "Running with -N=${N} and --ntasks-per-node=${tpn}"
-        
-        # Launch the job using srun with the current combination of parameters.
-        srun -N ${N} --ntasks-per-node ${tpn} ./kmer_hash_51 my_datasets/human-chr14-synthetic.txt
+        # Launch the job using srun with the current combination of parameters
+        srun -N ${N} --ntasks-per-node ${tpn} "${exec_with_file[@]}"
     done
 done
+
+
+# salloc -N 4 -A mp309 -t 10:00 --qos=interactive -C cpu srun -N 4 --ntasks-per-node 64 ./kmer_hash_51 my_datasets/human-chr14-synthetic.txt
+# salloc -N 1 -A mp309 -t 10:00 --qos=interactive -C cpu srun -N 1 --ntasks-per-node 2 ./kmer_hash_19 my_datasets/test.txt
+# cat test*.dat | sort > my_solution.txt
+# diff my_solution.txt my_datasets/test_solution.txt

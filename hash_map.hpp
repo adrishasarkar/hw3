@@ -202,24 +202,12 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
         seg_num_kmers_per_rank = seg_size / ((rank_n - 1) * sizeof(kmer_pair)); // in Bytes
         num_chunks = std::ceil(static_cast<double>(global_max_num_kmers_send) / seg_num_kmers_per_rank);
     }
-    
-    // All-to-all exchange of counts
-    for (int i = 0; i < rank_n; ++i) {
-        if (i != rank_me) {
-            upcxx::rpc(i, 
-                [](size_t count, int sender_rank, upcxx::dist_object<HashMap*>& dobj) {
-                    (*dobj)->recv_counts[sender_rank] = count;
-                }, send_counts[i], rank_me, dobj).wait();
-        } else {
-            recv_counts[i] = send_counts[i];
-        }
-    }
-    
-    // Ensure all ranks have received their counts
-    upcxx::barrier();
 
+    std::vector<upcxx::future<>> rpcs;
     // Allocate memory for sending kmers
-    for (int i = 0; i < rank_n; ++i) {
+    for (int j = 0; j < rank_n; ++j) {
+        int i = (rank_me + j) % rank_n;
+        
         if (i != rank_me && send_counts[i] > 0) {
             // Clean up any previous allocation
             if (send_ptrs[i] != nullptr) {
@@ -233,15 +221,20 @@ void HashMap::process_kmers(const std::vector<kmer_pair>& kmers) {
             send_ptrs[i] = upcxx::new_array<kmer_pair>(array_num_elems);
             
             // Send the pointer to the receiver rank
-            if (send_ptrs[i] != nullptr) {
+            rpcs.push_back(
                 upcxx::rpc(i, 
-                    [](upcxx::global_ptr<kmer_pair> ptr, int sender_rank, upcxx::dist_object<HashMap*>& dobj) {
-                        (*dobj)->recv_ptrs[sender_rank] = ptr;
-                    }, send_ptrs[i], rank_me, dobj).wait();
-            }
+                [](int sender_rank, size_t count, upcxx::global_ptr<kmer_pair> ptr, upcxx::dist_object<HashMap*>& dobj) {
+                    (*dobj)->recv_ptrs[sender_rank] = ptr;
+                    (*dobj)->recv_counts[sender_rank] = count;
+                }, rank_me, send_counts[i], send_ptrs[i], dobj)
+            );
         }
     }
     
+    if (!rpcs.empty()) {
+        upcxx::when_all(rpcs.begin(), rpcs.end()).wait();
+    }
+
     // Ensure all ranks have received their pointers
     upcxx::barrier();
 
